@@ -217,3 +217,7 @@ the 100 USD minimum.
   random assignment, stake-weighted checks and known-answer jobs.
 - While the network is small, a spot-check can wait an hour for a second node. If none takes it, the job is
   settled on its own result.
+
+## License
+
+[MIT](LICENSE)

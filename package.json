@@ -2,6 +2,7 @@
   "name": "idlex-node",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "Idlex node: runs AI jobs on an idle NVIDIA GPU, plus a local prototype of the scheduler.",
   "engines": {
