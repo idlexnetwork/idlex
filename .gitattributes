@@ -1,0 +1,2 @@
+# install.sh runs on Linux: keep it LF even on Windows checkouts with core.autocrlf.
+*.sh text eol=lf

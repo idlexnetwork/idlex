@@ -1,0 +1,29 @@
+{
+  "name": "idlex-node",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Idlex node: runs AI jobs on an idle NVIDIA GPU, plus a local prototype of the scheduler.",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "scheduler": "node src/scheduler.ts",
+    "node": "node src/node-client.ts",
+    "builder": "node src/builder.ts",
+    "demo": "node src/demo.ts",
+    "gpu-check": "node src/gpu-check.ts",
+    "test": "node src/selftest.ts",
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "dependencies": {
+    "pngjs": "^7.0.0",
+    "puppeteer-core": "^25.17.0",
+    "viem": "^2.57.19"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/pngjs": "^6.0.5",
+    "typescript": "^7.0.2"
+  }
+}
