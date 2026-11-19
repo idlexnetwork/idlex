@@ -130,6 +130,17 @@ node src/agent.ts start --owner 0xYOUR_WALLET --owner-sig 0xSIGNATURE --hours 0-
 
 On Linux, run the agent in tmux or screen, or as a service. It stops cleanly on SIGTERM.
 
+**Set your price (open market, beta).** Each node sets an ask per model, as a multiple of the listed price, from
+0.5 to 2. Builders pick the cheapest or the fastest offer, so a lower ask wins more jobs. Every verified job earns
+the same 100–200 $IDLEX whatever its price. Without `--ask` you ask 1×.
+
+```bash
+node src/agent.ts start --owner 0xYOUR_WALLET --owner-sig 0xSIGNATURE --ask 0.9
+node src/agent.ts start --owner 0xYOUR_WALLET --owner-sig 0xSIGNATURE --ask sd15=0.8,qwen2.5-3b=1.1
+```
+
+Live asks and recent priced jobs: https://www.idlex.network/market
+
 **Same output on Windows and Linux.** On the same NVIDIA GPU, the fixed text job in
 [src/xplat-check.ts](src/xplat-check.ts) gives byte-identical output with the Windows and Linux builds of
 llama.cpp, and each build repeats exactly. Image jobs have not been compared across the two systems yet.

@@ -2,7 +2,10 @@
 //
 //   node src/agent.ts init                                     create the node key (~/.idlex-node/key.json)
 //   node src/agent.ts link-message --owner 0xWALLET            print the message the owner wallet signs
-//   node src/agent.ts start [--network URL] [--owner 0x.. --owner-sig 0x..] [--hours 0-24] [--stake N] [--no-image] [--no-text]
+//   node src/agent.ts start [--network URL] [--owner 0x.. --owner-sig 0x..] [--hours 0-24] [--ask 0.9] [--stake N] [--no-image] [--no-text]
+//
+// --ask sets your price on the open market, as a multiple of the listed price (0.5 to 2): "--ask 0.9" for every
+// model, or per model: "--ask sd15=0.8,qwen2.5-7b=1.2". Lower asks win more jobs; without it you ask 1×.
 //
 // The node key only signs requests and receipts. The owner wallet (linked once with a signature,
 // no gas) holds the stake and receives the rewards, so this program never needs it.
@@ -61,6 +64,20 @@ function inHours(spec: string | undefined) {
   });
 }
 
+/** --ask "0.9" or "sd15=0.8,qwen2.5-3b=1.1": the open-market ask per model, as a multiple of the listed price. */
+export function parseAsk(spec: string | undefined, caps: string[]): Record<string, number> {
+  if (!spec) return {};
+  const models = caps.map((c) => c.split(":")[1]).filter(Boolean);
+  const out: Record<string, number> = {};
+  for (const part of spec.split(",").map((p) => p.trim()).filter(Boolean)) {
+    const [k, v] = part.includes("=") ? part.split("=") : ["*", part];
+    const x = Number(v);
+    if (!Number.isFinite(x) || x < 0.5 || x > 2) throw new Error(`--ask ${part}: the ask must be between 0.5 and 2 (times the listed price)`);
+    for (const m of k === "*" ? models : [k.trim()]) out[m] = x;
+  }
+  return out;
+}
+
 async function call(account: PrivateKeyAccount, base: string, path: string, body: unknown) {
   const text = JSON.stringify(body ?? {});
   const res = await fetch(base + path, { method: "POST", headers: await signedHeaders(account, "POST", path, text), body: text });
@@ -69,7 +86,7 @@ async function call(account: PrivateKeyAccount, base: string, path: string, body
 }
 
 export async function startAgent(opts: {
-  network: string; keyFile: string; owner?: string; ownerSig?: Hex; hours?: string; stake?: number; image: boolean; text: boolean;
+  network: string; keyFile: string; owner?: string; ownerSig?: Hex; hours?: string; ask?: string; stake?: number; image: boolean; text: boolean;
 }) {
   const account = loadOrCreateKey(opts.keyFile);
   const say = (m: string) => console.log(`${new Date().toISOString().slice(11, 19)} ${m}`);
@@ -94,9 +111,11 @@ export async function startAgent(opts: {
   }
   if (!caps.length) throw new Error("no AI runtime available: install the image model (Python env) or a text model (llama.cpp + GGUF)");
   say(`capabilities: ${caps.join(", ")}`);
+  const asks = parseAsk(opts.ask, caps);
+  if (Object.keys(asks).length) say(`open market asks: ${Object.entries(asks).map(([m, x]) => `${m} ${x}×`).join(", ")}`);
 
   const reg = await call(account, opts.network, `${API}/nodes/register`, {
-    gpu: gpu.name, gpuUuid: gpu.uuid, vramMb: gpu.vramMb, caps, benchmarkMs: 0, owner: opts.owner, ownerSig: opts.ownerSig,
+    gpu: gpu.name, gpuUuid: gpu.uuid, vramMb: gpu.vramMb, caps, benchmarkMs: 0, owner: opts.owner, ownerSig: opts.ownerSig, asks,
   });
   if (reg.status !== 200) throw new Error(`register failed: ${reg.data?.error}`);
   say(`registered · owner ${reg.data.owner} · can work: ${reg.data.canWork} · earns $IDLEX: ${reg.data.earnsIdlex} · mode ${reg.data.chainMode}`);
@@ -193,9 +212,9 @@ if (import.meta.main) {
     const stake = arg("stake");
     await startAgent({
       network: arg("network", "https://www.idlex.network")!, keyFile, owner: arg("owner"), ownerSig: arg("owner-sig") as Hex | undefined,
-      hours: arg("hours"), stake: stake ? Number(stake) : undefined, image: !flag("no-image"), text: !flag("no-text"),
+      hours: arg("hours"), ask: arg("ask"), stake: stake ? Number(stake) : undefined, image: !flag("no-image"), text: !flag("no-text"),
     });
   } else {
-    console.log("usage: node src/agent.ts init | link-message --owner 0x.. | start [--network url] [--owner 0x.. --owner-sig 0x..] [--hours 1-8,9-17] [--stake n] [--no-image] [--no-text]");
+    console.log("usage: node src/agent.ts init | link-message --owner 0x.. | start [--network url] [--owner 0x.. --owner-sig 0x..] [--hours 1-8,9-17] [--ask 0.9] [--stake n] [--no-image] [--no-text]");
   }
 }
