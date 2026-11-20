@@ -85,8 +85,24 @@ node could inflate it.
 ### 5. Rewards
 
 The verified receipts of each round are sealed into one Merkle root ([src/merkle.ts](src/merkle.ts)). Every
-verified job then draws a reward of 100–200 $IDLEX, computed from that root and its job id, so anyone can
-recompute each draw. The network pays out at most 10,000 $IDLEX per hour, and owners can claim at any time.
+verified job then draws a reward between the hour's minimum and maximum, computed from that root and its job id,
+so anyone can recompute each draw. The range and the hourly cap are set onchain before each hour starts, and
+owners can claim at any time. [src/verify-proofs.ts](src/verify-proofs.ts) prints the rules of any hour.
+
+### 6. Reputation tiers
+
+Every node has a public record: its verified jobs and checks, a reputation score (+0.01 for each verified
+result, −0.3 for a wrong one) and when it was last caught. The record sets its tier:
+
+| Tier | How to reach it | What it unlocks |
+| --- | --- | --- |
+| New | every node starts here | standard jobs, up to 1.25× a model's standard job |
+| Steady | 25 verified, reputation 0.9+, no wrong result for 7 days | large jobs (up to 2.5×), and large jobs first |
+| Trusted | 250 verified, reputation 0.98+, no wrong result for 30 days, 3+ days registered | every size, first pick of the largest |
+
+A job above every online node's tier is handed to any capable node after 90 seconds, and checks go to any node.
+The reward per job is the same at every tier. The agent prints your tier when it starts, and what the next one
+needs.
 
 ## Run a node
 
@@ -132,7 +148,7 @@ On Linux, run the agent in tmux or screen, or as a service. It stops cleanly on 
 
 **Set your price (open market, beta).** Each node sets an ask per model, as a multiple of the listed price, from
 0.5 to 2. Builders pick the cheapest or the fastest offer, so a lower ask wins more jobs. Every verified job earns
-the same 100–200 $IDLEX whatever its price. Without `--ask` you ask 1×.
+the same reward whatever its price. Without `--ask` you ask 1×.
 
 ```bash
 node src/agent.ts start --owner 0xYOUR_WALLET --owner-sig 0xSIGNATURE --ask 0.9
@@ -141,9 +157,58 @@ node src/agent.ts start --owner 0xYOUR_WALLET --owner-sig 0xSIGNATURE --ask sd15
 
 Live asks and recent priced jobs: https://www.idlex.network/market
 
+**Rent out your GPU (beta).** Put your node up for rent at an hourly rate from 0.05 to 5 USDG. A builder can then
+book it for 1 to 24 hours; while the booking runs, your node takes only their jobs. The renter pays for the time
+your node is online, in USDG like a job payment, and you keep earning $IDLEX for every verified job. Without
+`--rent` the node is not for rent.
+
+```bash
+node src/agent.ts start --owner 0xYOUR_WALLET --owner-sig 0xSIGNATURE --rent 0.25
+```
+
+GPUs for rent and their status: https://www.idlex.network/rent
+
 **Same output on Windows and Linux.** On the same NVIDIA GPU, the fixed text job in
 [src/xplat-check.ts](src/xplat-check.ts) gives byte-identical output with the Windows and Linux builds of
 llama.cpp, and each build repeats exactly. Image jobs have not been compared across the two systems yet.
+
+## Check the network yourself
+
+[src/verify-proofs.ts](src/verify-proofs.ts) recomputes the network's proofs from the published receipts and
+compares them with the contracts on Robinhood Chain, which it reads directly with the addresses built into the
+file:
+
+- every receipt (job, node, output hash, GPU time, epoch) hashes to its leaf;
+- the leaves give the Merkle root sealed onchain for the epoch, with the same count;
+- each hour's seed is the root of its receipts, each job's reward is drawn again from that seed within the
+  hour's onchain rules, and the sums per owner match the onchain credit, to the token.
+
+```bash
+node src/verify-proofs.ts                  # the latest sealed epoch and the latest hour of rewards
+node src/verify-proofs.ts --epoch 9        # one epoch seal
+node src/verify-proofs.ts --hour 57        # one hour of node rewards
+```
+
+It exits with code 1 if any check fails. The same checks run in the browser at https://www.idlex.network/verify.
+They prove that the records and the payouts match the chain, not that every GPU result was right: that part is
+the job of the spot checks above.
+
+## Builders: run jobs or rent a GPU
+
+[src/net-builder.ts](src/net-builder.ts) submits jobs with a builder key (`~/.idlex-node/builder.json`), paid with
+Compute Pass credits:
+
+```bash
+node src/net-builder.ts image --prompt "a rig glowing at night"
+node src/net-builder.ts text --prompt "Explain GPUs in one line" --max 128
+node src/net-builder.ts gpus                          # GPUs for rent, with their hourly rate
+node src/net-builder.ts rent --node 0xNODE --hours 2  # book one; your jobs then run on it
+node src/net-builder.ts rental --id r_…               # online time and charge so far
+node src/net-builder.ts end-rental --id r_…           # end a booking early
+```
+
+A booking holds rate × hours of your credits. You are charged only for the time the GPU was online, and the rest
+is released at the next epoch close.
 
 ## Try the whole network on one PC
 
@@ -216,7 +281,9 @@ the 100 USD minimum.
 | [src/verify.ts](src/verify.ts) | Tolerance checks for image and text outputs |
 | [src/protocol.ts](src/protocol.ts) | Job specs, prices, receipts and request signing |
 | [src/merkle.ts](src/merkle.ts) | Merkle root and proofs over receipts |
-| [src/net-builder.ts](src/net-builder.ts) | Submit image and text jobs to a scheduler |
+| [src/net-builder.ts](src/net-builder.ts) | Submit image and text jobs, and rent a GPU |
+| [src/verify-proofs.ts](src/verify-proofs.ts) | Recompute epoch seals and hourly rewards, and check them onchain |
+| [src/proof-math.ts](src/proof-math.ts) | Receipt leaves, Merkle root and reward draws, with only viem |
 | [src/xplat-check.ts](src/xplat-check.ts) | Compares a fixed job's output across machines |
 | [src/scheduler.ts](src/scheduler.ts), [src/ledger.ts](src/ledger.ts) | Local prototype scheduler and simulated ledger |
 | [src/node-client.ts](src/node-client.ts), [src/gpu-runner.ts](src/gpu-runner.ts), [src/kernel.ts](src/kernel.ts) | Prototype node and its WebGPU kernel |
@@ -228,6 +295,9 @@ the 100 USD minimum.
   random assignment, stake-weighted checks and known-answer jobs.
 - While the network is small, a spot-check can wait an hour for a second node. If none takes it, the job is
   settled on its own result.
+- Checks are sampled: a share of jobs is re-run, not every job, so a wrong result has a chance of being caught,
+  not a certainty.
+- GPU rental is in beta. A booking is reserved job time on the GPU, not access to the machine.
 
 ## License
 
