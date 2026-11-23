@@ -3,6 +3,7 @@
 // so the scheduler compares fingerprints instead of hashes:
 //   image: a 64-bit difference hash (dHash) of the decoded PNG; match when ≤ IMAGE_MAX_BITS differ
 //   text:  whitespace-normalized output; match when the edit-distance similarity ≥ TEXT_MIN_SIMILARITY
+//   embed: int8-quantized vectors; match when every pair has cosine similarity ≥ EMBED_MIN_COSINE
 // Shared by the scheduler (Next.js API) and the node prototype; only depends on pngjs.
 import { PNG } from "pngjs";
 
@@ -82,5 +83,55 @@ export function textSimilarity(a: string, b: string): number {
 export function fingerprintsMatch(kind: string, a: string, b: string): boolean {
   if (kind === "image") return hammingHex(a, b) <= IMAGE_MAX_BITS;
   if (kind === "text") return textSimilarity(a, b) >= TEXT_MIN_SIMILARITY;
+  if (kind === "embed") return embedSimilarity(a, b) >= EMBED_MIN_COSINE;
   return a === b; // julia: exact pixel hash
+}
+
+// ---- embeddings ---------------------------------------------------------------------------
+/** Two honest GPUs give embeddings that agree to at least this cosine similarity, text by text. */
+export const EMBED_MIN_COSINE = 0.99;
+
+/** Parses a node's embedding output (a JSON list of vectors) and checks its shape; null if it is malformed. */
+export function parseEmbeddings(json: string, count: number, dims: number): number[][] | null {
+  try {
+    const v = JSON.parse(json) as unknown;
+    if (!Array.isArray(v) || v.length !== count) return null;
+    for (const row of v) {
+      if (!Array.isArray(row) || row.length !== dims || !row.every((x) => typeof x === "number" && Number.isFinite(x))) return null;
+    }
+    return v as number[][];
+  } catch {
+    return null;
+  }
+}
+
+/** Compact fingerprint: each vector quantized to int8 (scaled to its largest component), base64, joined by "|". */
+export function embedFingerprint(vectors: number[][]): string {
+  return vectors
+    .map((v) => {
+      // Scale by the largest component, not the norm: unit-vector components are small, and 127 x a component
+      // would leave only a few levels. Cosine similarity ignores the scale.
+      const m = Math.max(...v.map(Math.abs)) || 1;
+      return Buffer.from(Int8Array.from(v.map((x) => Math.round((x / m) * 127))).buffer).toString("base64");
+    })
+    .join("|");
+}
+
+/** Lowest cosine similarity between matching vectors of two fingerprints (0 if their shapes differ). */
+export function embedSimilarity(a: string, b: string): number {
+  const A = a.split("|"), B = b.split("|");
+  if (A.length !== B.length) return 0;
+  let worst = 1;
+  for (let i = 0; i < A.length; i++) {
+    const x = new Int8Array(Buffer.from(A[i], "base64")), y = new Int8Array(Buffer.from(B[i], "base64"));
+    if (x.length !== y.length || !x.length) return 0;
+    let dot = 0, nx = 0, ny = 0;
+    for (let k = 0; k < x.length; k++) {
+      dot += x[k] * y[k];
+      nx += x[k] * x[k];
+      ny += y[k] * y[k];
+    }
+    worst = Math.min(worst, dot / (Math.sqrt(nx * ny) || 1));
+  }
+  return worst;
 }

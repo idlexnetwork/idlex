@@ -116,3 +116,153 @@ export function checkHour(p: HourProof, rules: { min: bigint; max: bigint; cap: 
     ],
   };
 }
+
+// ---- Holder Vault payouts --------------------------------------------------------------------------------------
+// Each epoch the vault splits its NVDA budget over qualifying $IDLEX holders by balance x seconds held, plus up to
+// 10 whitelisted team devices, each weighted as `multiplier` minimum holders for the whole epoch (a team device that
+// also qualifies as a holder gets the larger of the two). Amounts are budget x share / all shares, rounded down;
+// wallets that would get 0 are left out. The scheduler sends the result in one distribute(epoch, holders, amounts).
+
+/** The first $IDLEX transfer (the mint) on Robinhood Chain: every balance starts there. */
+export const IDLEX_FROM = 116_295_000n;
+
+export type PayoutProof = {
+  epoch: number;
+  start: number;
+  end: number;
+  epochSeconds: number;
+  tx: Hex | null;
+  vault: Address | null;
+  budget: string | null;
+  multiplier: number | null;
+  teamBps: number | null;
+  holders: number | null;
+  teamDevices: number | null;
+  /** Recorded with each payout from the release of payout checks on; null for earlier epochs. */
+  minimum: string | null;
+  shares: [string, string, number][] | null;
+};
+
+/** The distribute call as decoded from the chain. */
+export type PayoutCall = { to: Address | null; success: boolean; epoch: bigint; holders: Address[]; amounts: bigint[] };
+
+export type PayoutRow = { wallet: Address; amount: bigint; bps: number; team: boolean; expected: bigint | null };
+
+/** The split as the scheduler computes it from the recorded shares. */
+export function splitOf(budget: bigint, shares: [string, bigint][]): Map<string, bigint> {
+  const total = shares.reduce((a, [, s]) => a + s, 0n);
+  const out = new Map<string, bigint>();
+  if (total === 0n) return out;
+  for (const [w, s] of shares) {
+    const amount = (budget * s) / total;
+    if (amount > 0n) out.set(w.toLowerCase(), amount);
+  }
+  return out;
+}
+
+/**
+ * Checks one payout: the call itself, its total against the published budget, the team devices' share (team = the
+ * wallets whitelisted onchain), and, where the split's inputs were recorded, that they recompute to exactly the
+ * amounts sent with every team weight at multiplier x minimum x epoch length.
+ */
+export function checkPayout(p: PayoutProof, call: PayoutCall | null, team: Set<string>): { checks: Check[]; rows: PayoutRow[] } {
+  const checks: Check[] = [];
+  if (!call) {
+    checks.push({ ok: p.tx ? false : null, label: p.tx ? "the payout transaction could not be read" : "no NVDA was sent for this epoch" });
+    return { checks, rows: [] };
+  }
+  checks.push({
+    ok: call.success && Boolean(p.vault) && call.to?.toLowerCase() === p.vault?.toLowerCase() && call.epoch === BigInt(p.epoch),
+    label: `the payout is a successful distribute call to the Holder Vault for epoch ${p.epoch}`,
+    detail: !call.success ? "the transaction reverted" : call.epoch !== BigInt(p.epoch) ? `it is for epoch ${call.epoch}` : "it was sent to another contract",
+  });
+  const paid = call.amounts.reduce((a, x) => a + x, 0n);
+  const teamPaid = call.holders.reduce((a, w, i) => a + (team.has(w.toLowerCase()) ? call.amounts[i] : 0n), 0n);
+  const isTeam = (w: string) => team.has(w.toLowerCase());
+  const budget = p.budget ? BigInt(p.budget) : null;
+  checks.push({
+    ok: budget === null ? null : paid <= budget,
+    label: budget === null ? "no budget was published for this epoch (before team weights)" : "the total sent is within the published budget",
+    detail: budget === null ? undefined : `${paid} sent, budget ${budget}`,
+  });
+  const teamN = call.holders.filter(isTeam).length;
+  const bps = paid > 0n ? Number((teamPaid * 10_000n) / paid) : 0;
+  if (p.teamBps !== null) {
+    checks.push({
+      ok: Math.abs(bps - p.teamBps) <= 1,
+      label: `team devices received ${(bps / 100).toFixed(2)}% of it, as published on the Rewards page`,
+      detail: `published ${(p.teamBps / 100).toFixed(2)}%`,
+    });
+    checks.push({
+      ok: teamN === p.teamDevices && call.holders.length - teamN === p.holders,
+      label: `${call.holders.length - teamN} holders and ${teamN} team devices were paid, as published`,
+      detail: `published ${p.holders} holders and ${p.teamDevices} team devices`,
+    });
+  }
+
+  let expected: Map<string, bigint> | null = null;
+  if (p.shares && p.minimum && budget !== null && p.multiplier !== null) {
+    const shares = p.shares.map(([w, s, t]) => ({ w: w.toLowerCase(), s: BigInt(s), t: t === 1 }));
+    expected = splitOf(budget, shares.map((x) => [x.w, x.s]));
+    const sent = new Map(call.holders.map((w, i) => [w.toLowerCase(), call.amounts[i]] as const));
+    const same = expected.size === sent.size && [...expected].every(([w, a]) => sent.get(w) === a);
+    checks.push({ ok: same, label: `the recorded shares recompute to exactly the ${sent.size} amounts sent`, detail: same ? undefined : "amounts differ" });
+    const weight = BigInt(p.minimum) * BigInt(p.epochSeconds) * BigInt(p.multiplier);
+    const teamShares = shares.filter((x) => x.t);
+    checks.push({
+      ok: teamShares.every((x) => x.s >= weight),
+      detail: `weight ${weight}`,
+      label: `each team device counts as ${p.multiplier} minimum holders for the whole epoch (or its own holding, if larger)`,
+    });
+    const flags = shares.every((x) => x.t === team.has(x.w));
+    checks.push({ ok: flags, label: "the wallets marked as team devices are exactly the ones whitelisted onchain" });
+  } else {
+    checks.push({ ok: null, label: "the split's inputs were not recorded for this epoch (recorded from Nov 2026 on), so only the call is checked" });
+  }
+
+  const rows = call.holders
+    .map((w, i) => ({
+      wallet: w,
+      amount: call.amounts[i],
+      bps: paid > 0n ? Number((call.amounts[i] * 10_000n) / paid) : 0,
+      team: isTeam(w),
+      expected: expected ? (expected.get(w.toLowerCase()) ?? 0n) : null,
+    }))
+    .sort((a, b) => (a.amount > b.amount ? -1 : a.amount < b.amount ? 1 : 0));
+  return { checks, rows };
+}
+
+/**
+ * Independent recompute of holdings from $IDLEX transfers (the deep check in verify-proofs.ts): replays every change
+ * in order and returns each wallet's balance x seconds and lowest balance over [start, end]. A change is a transfer
+ * leg (or a slash) with its block time; moves into and out of the staking contract must be dropped by the caller.
+ */
+export function holdingsOver(changes: { t: number; wallet: string; delta: bigint }[], start: number, end: number) {
+  const bal = new Map<string, bigint>();
+  const out = new Map<string, { accum: bigint; min: bigint }>();
+  const since = new Map<string, number>();
+  const touch = (w: string) => {
+    if (!out.has(w)) out.set(w, { accum: 0n, min: bal.get(w) ?? 0n });
+    if (!since.has(w)) since.set(w, start);
+  };
+  for (const c of changes) {
+    if (c.t > end) break;
+    const w = c.wallet.toLowerCase();
+    if (c.t <= start) {
+      bal.set(w, (bal.get(w) ?? 0n) + c.delta);
+      continue;
+    }
+    touch(w);
+    const o = out.get(w)!;
+    o.accum += (bal.get(w) ?? 0n) * BigInt(c.t - since.get(w)!);
+    bal.set(w, (bal.get(w) ?? 0n) + c.delta);
+    since.set(w, c.t);
+    if (bal.get(w)! < o.min) o.min = bal.get(w)!;
+  }
+  for (const [w, b] of bal) {
+    touch(w);
+    const o = out.get(w)!;
+    o.accum += b * BigInt(end - since.get(w)!);
+  }
+  return out;
+}

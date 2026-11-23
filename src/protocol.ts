@@ -84,10 +84,12 @@ export function priceCredits(p: JuliaParams): bigint {
 // ---- AI jobs (v2) -------------------------------------------------------------------------
 /**
  * Real AI jobs. Outputs are not bit-exact across GPUs, so the scheduler compares results with a
- * tolerance (see verify.ts): a perceptual hash for images, normalized text for LLM output.
+ * tolerance (see verify.ts): a perceptual hash for images, normalized text for LLM output, cosine similarity
+ * for embeddings.
  */
 export type ImageModel = "sd15";
 export type TextModel = "qwen2.5-3b" | "qwen2.5-7b";
+export type EmbedModel = "nomic-embed-v1.5";
 export type ImageParams = {
   model: ImageModel;
   prompt: string; // 1..1000 chars
@@ -104,10 +106,18 @@ export type TextParams = {
   system: string; // 0..2000 chars
   maxTokens: number; // 16..1024; decoding is greedy (temperature 0) so a spot-check can repeat it
 };
+/** Text embeddings (search, RAG, agent memory): one 768-dim, L2-normalized vector per input text. */
+export type EmbedParams = {
+  model: EmbedModel;
+  texts: string[]; // 1..32 texts, each 1..2000 chars (the model reads at most 2,048 tokens), 32,000 chars in all
+  mode: "document" | "query"; // nomic's task prefix: documents to index, or queries to search them with
+};
+export const EMBED_DIMS = 768;
 export type JobSpec =
   | { kind: "julia"; params: JuliaParams }
   | { kind: "image"; params: ImageParams }
-  | { kind: "text"; params: TextParams };
+  | { kind: "text"; params: TextParams }
+  | { kind: "embed"; params: EmbedParams };
 export type JobKind = JobSpec["kind"];
 
 /** VRAM a node needs for each model (MB), and its capability tag. */
@@ -115,6 +125,7 @@ export const MODELS = {
   sd15: { kind: "image", vramMb: 4_000, tag: "image:sd15" },
   "qwen2.5-3b": { kind: "text", vramMb: 3_500, tag: "text:qwen2.5-3b" },
   "qwen2.5-7b": { kind: "text", vramMb: 6_500, tag: "text:qwen2.5-7b" },
+  "nomic-embed-v1.5": { kind: "embed", vramMb: 1_000, tag: "embed:nomic-embed-v1.5" },
 } as const;
 
 export function validateSpec(s: unknown): JobSpec {
@@ -153,7 +164,22 @@ export function validateSpec(s: unknown): JobSpec {
       params: { model: p.model, prompt: str("prompt", 1, 8000), system: str("system", 0, 2000), maxTokens: int("maxTokens", 16, 1024) },
     };
   }
-  throw new Error("kind must be julia, image or text");
+  if (o?.kind === "embed") {
+    if (p.model !== "nomic-embed-v1.5") throw new Error("embed model must be nomic-embed-v1.5");
+    const texts = p.texts;
+    if (!Array.isArray(texts) || texts.length < 1 || texts.length > 32) throw new Error("param texts must be a list of 1..32 texts");
+    let total = 0;
+    for (const t of texts) {
+      // nomic-embed has a 2,048-token context: 2,000 chars fit even at one char a token, with the task prefix.
+      if (typeof t !== "string" || t.length < 1 || t.length > 2000) throw new Error("each text must be 1..2000 chars");
+      total += t.length;
+    }
+    if (total > 32_000) throw new Error("texts must be 32,000 chars in all at most");
+    const mode = p.mode ?? "document";
+    if (mode !== "document" && mode !== "query") throw new Error('param mode must be "document" or "query"');
+    return { kind: "embed", params: { model: "nomic-embed-v1.5", texts: texts as string[], mode } };
+  }
+  throw new Error("kind must be julia, image, text or embed");
 }
 
 /** Model and VRAM a job needs. */
@@ -171,6 +197,7 @@ export function needs(s: JobSpec): { model: string; tag: string; vramMb: number 
 export function workOf(s: JobSpec): bigint {
   if (s.kind === "julia") return (BigInt(s.params.width) * BigInt(s.params.height) * BigInt(s.params.maxIter)) / 100_000n + 1n;
   if (s.kind === "image") return BigInt(Math.round((s.params.width * s.params.height * s.params.steps) / (512 * 512) * 160));
+  if (s.kind === "embed") return BigInt(Math.ceil(embedTokens(s.params) / 2) + 20);
   return BigInt(s.params.maxTokens * (s.params.model === "qwen2.5-7b" ? 32 : 16) + Math.ceil(s.params.prompt.length / 4));
 }
 
@@ -179,6 +206,7 @@ export function workOf(s: JobSpec): bigint {
  * - julia: 0.02 USDG per billion pixel-iterations, at least 0.001
  * - image: 0.004 USDG for 512x512 at 20 steps, scaled by pixels x steps, at least 0.001
  * - text: 0.002 USDG per 1,000 tokens (prompt / 4 chars + maxTokens), x2 for the 7B model, at least 0.0005
+ * - embed: 0.0002 USDG per 1,000 tokens (chars / 4), at least 0.0001
  */
 export function priceSpec(s: JobSpec): bigint {
   if (s.kind === "julia") return priceCredits(s.params);
@@ -186,9 +214,18 @@ export function priceSpec(s: JobSpec): bigint {
     const c = BigInt(Math.round((4_000 * s.params.width * s.params.height * s.params.steps) / (512 * 512 * 20)));
     return c < 1_000n ? 1_000n : c;
   }
+  if (s.kind === "embed") {
+    const c = BigInt(Math.round(embedTokens(s.params) * 0.2));
+    return c < 100n ? 100n : c;
+  }
   const tokens = Math.ceil(s.params.prompt.length / 4) + Math.ceil(s.params.system.length / 4) + s.params.maxTokens;
   const c = BigInt(Math.round(tokens * 2 * (s.params.model === "qwen2.5-7b" ? 2 : 1)));
   return c < 500n ? 500n : c;
+}
+
+/** Approximate tokens of an embedding job: 4 characters a token, plus the task prefix of each text. */
+export function embedTokens(p: EmbedParams): number {
+  return p.texts.reduce((a, t) => a + Math.ceil(t.length / 4) + 4, 0);
 }
 
 /** Job id for any spec: keccak of the builder, a nonce and the canonical spec. */

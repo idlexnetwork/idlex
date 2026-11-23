@@ -2,7 +2,12 @@
 //
 //   node src/agent.ts init                                     create the node key (~/.idlex-node/key.json)
 //   node src/agent.ts link-message --owner 0xWALLET            print the message the owner wallet signs
-//   node src/agent.ts start [--network URL] [--owner 0x.. --owner-sig 0x..] [--hours 0-24] [--ask 0.9] [--rent 0.25] [--stake N] [--no-image] [--no-text]
+//   node src/agent.ts start [--network URL] [--owner 0x.. --owner-sig 0x..] [--hours 0-24] [--ask 0.9] [--rent 0.25] [--stake N] [--no-image] [--no-text] [--no-embed]
+//   node src/agent.ts model list | model add qwen2.5-7b      see and download models (models.ts)
+//
+// Text models: the node offers each one on disk that fits its VRAM next to the image model (one text model is loaded
+// at a time). Qwen2.5 7B needs about 6.5 GB on its own, so an 8 GB card offers it with --no-image, and a card with
+// 12 GB or more offers it next to images.
 //
 // --ask sets your price on the open market, as a multiple of the listed price (0.5 to 2): "--ask 0.9" for every
 // model, or per model: "--ask sd15=0.8,qwen2.5-7b=1.2". Lower asks win more jobs; without it you ask 1×.
@@ -21,8 +26,9 @@ import { promisify } from "node:util";
 import type { Hex } from "viem";
 import type { PrivateKeyAccount } from "viem/accounts";
 import { loadOrCreateKey } from "./node-client.ts";
-import { ImageRunner, TextRunner } from "./ai-runners.ts";
-import { MODELS, linkMessage, sha256Hex, signReceipt, signedHeaders, validateSpec, type JobSpec } from "./protocol.ts";
+import { EmbedRunner, ImageRunner, PATHS, TextRunner } from "./ai-runners.ts";
+import { DOWNLOADS, addModel, onDisk } from "./models.ts";
+import { MODELS, linkMessage, sha256Hex, signReceipt, signedHeaders, validateSpec, type JobSpec, type TextModel } from "./protocol.ts";
 
 const run = promisify(execFile);
 const arg = (name: string, fallback?: string) => {
@@ -58,6 +64,12 @@ async function gpuBusyOrHot(ownPids: Set<number>): Promise<string | null> {
   return null;
 }
 
+/** Text models this GPU can hold: one text model at a time, next to the image model when images are on. */
+export function textModelsThatFit(vramMb: number, models: TextModel[], withImage: boolean) {
+  const room = vramMb - (withImage ? MODELS.sd15.vramMb : 0);
+  return { fit: models.filter((m) => MODELS[m].vramMb <= room), tooBig: models.filter((m) => MODELS[m].vramMb > room) };
+}
+
 /** --hours "1-8,9-17": local hours when the node may work. */
 function inHours(spec: string | undefined) {
   if (!spec) return true;
@@ -90,7 +102,7 @@ async function call(account: PrivateKeyAccount, base: string, path: string, body
 }
 
 export async function startAgent(opts: {
-  network: string; keyFile: string; owner?: string; ownerSig?: Hex; hours?: string; ask?: string; rent?: string; stake?: number; image: boolean; text: boolean;
+  network: string; keyFile: string; owner?: string; ownerSig?: Hex; hours?: string; ask?: string; rent?: string; stake?: number; image: boolean; text: boolean; embed: boolean;
 }) {
   const account = loadOrCreateKey(opts.keyFile);
   const say = (m: string) => console.log(`${new Date().toISOString().slice(11, 19)} ${m}`);
@@ -99,10 +111,12 @@ export async function startAgent(opts: {
 
   const image = new ImageRunner();
   const text = new TextRunner();
+  const embed = new EmbedRunner();
   // Never leave llama-server or the image worker holding VRAM after the agent exits (error, second signal).
   process.on("exit", () => {
     image.stop();
     text.stop();
+    embed.stop();
   });
   const caps: string[] = [];
   if (opts.image && image.available() && gpu.vramMb >= MODELS.sd15.vramMb) {
@@ -111,8 +125,14 @@ export async function startAgent(opts: {
     caps.push(MODELS.sd15.tag);
   }
   if (opts.text && text.available()) {
-    for (const m of TextRunner.modelsOnDisk()) if (gpu.vramMb >= MODELS[m].vramMb) caps.push(MODELS[m].tag);
+    const { fit, tooBig } = textModelsThatFit(gpu.vramMb, TextRunner.modelsOnDisk(), caps.includes(MODELS.sd15.tag));
+    for (const m of fit) caps.push(MODELS[m].tag);
+    for (const m of tooBig) {
+      const alone = MODELS[m].vramMb <= gpu.vramMb;
+      say(`${m} is on disk but needs ${MODELS[m].vramMb} MB${caps.includes(MODELS.sd15.tag) ? " next to the image model" : ""}${alone ? ": start with --no-image to offer it" : ": this GPU is too small for it"}`);
+    }
   }
+  if (opts.embed && embed.available() && gpu.vramMb >= MODELS["nomic-embed-v1.5"].vramMb) caps.push(MODELS["nomic-embed-v1.5"].tag);
   if (!caps.length) throw new Error("no AI runtime available: install the image model (Python env) or a text model (llama.cpp + GGUF)");
   say(`capabilities: ${caps.join(", ")}`);
   const asks = parseAsk(opts.ask, caps);
@@ -190,6 +210,11 @@ export async function startAgent(opts: {
         outputHash = sha256Hex(r.text);
         gpuMs = r.gpuMs;
         body = { text: r.text };
+      } else if (spec.kind === "embed") {
+        const r = await embed.run(spec.params, say);
+        outputHash = sha256Hex(r.json);
+        gpuMs = r.gpuMs;
+        body = { vectors: r.json };
       } else {
         say(`skipping ${spec.kind} job: not supported by this agent`);
         continue;
@@ -203,6 +228,7 @@ export async function startAgent(opts: {
     }
   }
   image.stop();
+  embed.stop();
   text.stop();
 }
 
@@ -221,9 +247,28 @@ if (import.meta.main) {
     const stake = arg("stake");
     await startAgent({
       network: arg("network", "https://www.idlex.network")!, keyFile, owner: arg("owner"), ownerSig: arg("owner-sig") as Hex | undefined,
-      hours: arg("hours"), ask: arg("ask"), rent: arg("rent"), stake: stake ? Number(stake) : undefined, image: !flag("no-image"), text: !flag("no-text"),
+      hours: arg("hours"), ask: arg("ask"), rent: arg("rent"), stake: stake ? Number(stake) : undefined, image: !flag("no-image"), text: !flag("no-text"), embed: !flag("no-embed"),
     });
+  } else if (cmd === "model" && process.argv[3] === "add") {
+    const model = process.argv[4];
+    if (!model) throw new Error(`usage: node src/agent.ts model add <${Object.keys(DOWNLOADS).join(" | ")}>`);
+    await addModel(PATHS.models, model, (m) => console.log(m));
+    console.log(`${model} is ready. Restart the node to offer it.`);
+  } else if (cmd === "model") {
+    const gpu = await probeGpu().catch(() => null);
+    const text = (Object.keys(MODELS) as (keyof typeof MODELS)[]).filter((m) => MODELS[m].kind === "text") as TextModel[];
+    const here = text.filter((m) => onDisk(PATHS.models, m));
+    const withImage = textModelsThatFit(gpu?.vramMb ?? 0, here, true).fit;
+    const alone = textModelsThatFit(gpu?.vramMb ?? 0, here, false).fit;
+    console.log(gpu ? `${gpu.name} · ${gpu.vramMb} MB` : "no NVIDIA GPU found");
+    for (const m of text) {
+      const gb = DOWNLOADS[m].reduce((s, p) => s + p.bytes, 0) / 1e9;
+      const state = !here.includes(m)
+        ? `not downloaded (${gb.toFixed(1)} GB): node src/agent.ts model add ${m}`
+        : withImage.includes(m) ? "offered" : alone.includes(m) ? "offered with --no-image" : "too big for this GPU";
+      console.log(`  ${m.padEnd(12)} needs ${MODELS[m].vramMb} MB · ${state}`);
+    }
   } else {
-    console.log("usage: node src/agent.ts init | link-message --owner 0x.. | start [--network url] [--owner 0x.. --owner-sig 0x..] [--hours 1-8,9-17] [--ask 0.9] [--rent 0.25] [--stake n] [--no-image] [--no-text]");
+    console.log("usage: node src/agent.ts init | link-message --owner 0x.. | start [--network url] [--owner 0x.. --owner-sig 0x..] [--hours 1-8,9-17] [--ask 0.9] [--rent 0.25] [--stake n] [--no-image] [--no-text] [--no-embed] | model list | model add <model>");
   }
 }

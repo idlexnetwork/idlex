@@ -71,6 +71,19 @@ New-Item -ItemType Directory -Force models | Out-Null
 Fetch "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf" "models\qwen2.5-3b-instruct-q4_k_m.gguf" ""
 # The image model (Stable Diffusion 1.5) downloads into models\hf on the first image job.
 
+Step "Embedding model (nomic-embed-text v1.5, 140 MB)"
+Fetch "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q8_0.gguf" "models\nomic-embed-text-v1.5.Q8_0.gguf" "3e24342164b3d94991ba9692fdc0dd08e3fd7362e0aacc396a9a5c54a544c3b7"
+
+Step "Bigger text model (Qwen2.5-7B Instruct, 4.7 GB)"
+$vram = [int]((& nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | Select-Object -First 1).Trim())
+if ($vram -ge 10500) {
+  node src/agent.ts model add qwen2.5-7b
+  if ($LASTEXITCODE -ne 0) { Write-Host "  The 7B download stopped. Run it again later (it resumes): node src/agent.ts model add qwen2.5-7b" -ForegroundColor Yellow }
+} else {
+  Write-Host "  Skipped: this GPU has $vram MB. Qwen2.5 7B needs about 10.5 GB next to the image model."
+  Write-Host "  On an 8 GB card you can still add it (node src/agent.ts model add qwen2.5-7b) and start with --no-image."
+}
+
 Step "Node key"
 node src/agent.ts init
 

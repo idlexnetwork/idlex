@@ -6,7 +6,8 @@
 //   node src/net-builder.ts gpus                                     GPUs for rent, with their hourly rate
 //   node src/net-builder.ts rent --node 0x… --hours 2                book a GPU; your image/text jobs then run on it
 //   node src/net-builder.ts rental --id r_…  |  end-rental --id r_…   status, or end a booking early
-//   ... [--network http://localhost:3130] [--key-file ~/.idlex-node/builder.json]
+//   node src/net-builder.ts extend-rental --id r_… --hours 2         add hours to a running booking, at its rate
+//   ... [--network http://localhost:3130] [--key-file ~/.idlex-node/builder.json] [--api-key idx_… | IDLEX_API_KEY=idx_…]
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -20,9 +21,15 @@ const arg = (name: string, fallback?: string) => {
 const base = arg("network", "https://www.idlex.network")!;
 const account = loadOrCreateKey(arg("key-file", join(homedir(), ".idlex-node", "builder.json"))!);
 
+// An API key from idlex.network/build sends jobs instead of signing them; everything else is signed by the key file.
+const apiKey = arg("api-key", process.env.IDLEX_API_KEY);
+
 async function post(path: string, body: unknown) {
   const text = JSON.stringify(body);
-  const res = await fetch(base + path, { method: "POST", headers: await signedHeaders(account, "POST", path, text), body: text });
+  const headers = apiKey && path === "/api/network/jobs"
+    ? { "content-type": "application/json", authorization: `Bearer ${apiKey}` }
+    : await signedHeaders(account, "POST", path, text);
+  const res = await fetch(base + path, { method: "POST", headers, body: text });
   return { status: res.status, data: (await res.json().catch(() => null)) as any };
 }
 
@@ -46,7 +53,7 @@ if (cmd === "credits") {
       : { kind: "text", params: { model: (arg("model", "qwen2.5-3b") as "qwen2.5-3b"), prompt: arg("prompt", "In one sentence, what is a GPU?")!, system: "", maxTokens: Number(arg("max", "128")) } };
   const sub = await post("/api/network/jobs", { spec });
   if (sub.status !== 200) throw new Error(`submit failed: ${sub.data?.error}`);
-  console.log(`builder ${account.address} submitted ${cmd} job ${sub.data.jobId}${sub.data.rental ? ` on your rented GPU (${sub.data.matchedNode})` : ` for ${Number(sub.data.credits) / 1e6} USDG`}`);
+  console.log(`builder ${apiKey ? "(API key)" : account.address} submitted ${cmd} job ${sub.data.jobId}${sub.data.rental ? ` on your rented GPU (${sub.data.matchedNode})` : ` for ${Number(sub.data.credits) / 1e6} USDG`}`);
   const j = await waitFor(sub.data.jobId);
   console.log(`status ${j.status}${j.checked ? " (spot-checked)" : ""}${j.note ? ` · ${j.note}` : ""}`);
   if (j.output_text) console.log(`\n${j.output_text}\n`);
@@ -72,6 +79,10 @@ if (cmd === "credits") {
   console.log(await fetch(`${base}/api/network/rentals/${arg("id")}`).then((x) => x.json()));
 } else if (cmd === "end-rental") {
   console.log((await post(`/api/network/rentals/${arg("id")}/end`, {})).data);
+} else if (cmd === "extend-rental") {
+  const x = await post(`/api/network/rentals/${arg("id")}/extend`, { hours: Number(arg("hours", "1")) });
+  if (x.status !== 200) throw new Error(`extend failed: ${x.data?.error}`);
+  console.log(`extended ${x.data.id}: ${x.data.hours} h booked in all, now until ${x.data.endsAt}; ${Number(x.data.held) / 1e6} USDG held in all`);
 } else {
-  console.log("usage: node src/net-builder.ts credits --usdg 5 | image --prompt ... | text --prompt ... | gpus | rent --node 0x.. --hours 2 | rental --id r_.. | end-rental --id r_.. [--network url]");
+  console.log("usage: node src/net-builder.ts credits --usdg 5 | image --prompt ... | text --prompt ... | gpus | rent --node 0x.. --hours 2 | rental --id r_.. | extend-rental --id r_.. --hours 2 | end-rental --id r_.. [--network url]");
 }

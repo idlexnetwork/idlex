@@ -60,9 +60,13 @@ The agent ([src/agent.ts](src/agent.ts)) checks before every task and pauses whe
 | --- | --- | --- |
 | Image | Stable Diffusion 1.5 | PyTorch CUDA ([python/image_worker.py](python/image_worker.py)) |
 | Text | Qwen2.5 3B / 7B (GGUF) | llama.cpp `llama-server`, greedy decoding |
+| Embeddings | nomic-embed-text v1.5 (GGUF), 768 dimensions | llama.cpp `llama-server` in embedding mode |
 
 Every job comes with its seed and settings, so two honest GPUs return the same output or one that is very
 close.
+
+The installers fetch the embedding model (140 MB), and a node offers it next to the others. Start with
+`--no-embed` to leave it out.
 
 ### 4. Receipts and checks
 
@@ -75,7 +79,8 @@ The scheduler first checks that the output matches the signed hash. Then it:
 - re-runs a node's first 5 jobs on a different node (probation), and about 10% of its jobs after that;
 - compares the two outputs with a tolerance ([src/verify.ts](src/verify.ts)):
   - images: a 64-bit perceptual hash, at most 12 bits apart;
-  - text: an edit-distance similarity of at least 0.9.
+  - text: an edit-distance similarity of at least 0.9;
+  - embeddings: a cosine similarity of at least 0.99 for every vector.
 - calls a third node when the two disagree. The node whose result differs from the other two loses part of its
   stake. If no two results agree, the job is marked disputed and the builder gets a refund.
 
@@ -172,6 +177,18 @@ GPUs for rent and their status: https://www.idlex.network/rent
 [src/xplat-check.ts](src/xplat-check.ts) gives byte-identical output with the Windows and Linux builds of
 llama.cpp, and each build repeats exactly. Image jobs have not been compared across the two systems yet.
 
+### Bigger text model (Qwen2.5 7B)
+
+```bash
+node src/agent.ts model list               # models on disk and what this GPU can offer
+node src/agent.ts model add qwen2.5-7b     # 4.7 GB in two parts, resumable, SHA-256 checked (src/models.ts)
+```
+
+The node offers each text model on disk that fits its VRAM next to the image model (one text model is
+loaded at a time): 7B needs about 6.5 GB, so a card with about 11 GB or more offers it next to images, and
+an 8 GB card offers it with `--no-image`. The installers fetch 7B on their own when the card has
+10.5 GB or more. A 7B job is listed at 2× the 3B price.
+
 ## Check the network yourself
 
 [src/verify-proofs.ts](src/verify-proofs.ts) recomputes the network's proofs from the published receipts and
@@ -181,12 +198,18 @@ file:
 - every receipt (job, node, output hash, GPU time, epoch) hashes to its leaf;
 - the leaves give the Merkle root sealed onchain for the epoch, with the same count;
 - each hour's seed is the root of its receipts, each job's reward is drawn again from that seed within the
-  hour's onchain rules, and the sums per owner match the onchain credit, to the token.
+  hour's onchain rules, and the sums per owner match the onchain credit, to the token;
+- each NVDA payout to holders goes to the wallets that held the holder minimum for the whole epoch, with the
+  amounts its published split gives. Team devices are marked in the split, and the tool checks that they are
+  exactly the wallets whitelisted onchain and that each one is weighted as the published multiplier. With
+  `--deep` it rebuilds every holding from the $IDLEX transfers instead of trusting the published list.
 
 ```bash
 node src/verify-proofs.ts                  # the latest sealed epoch and the latest hour of rewards
 node src/verify-proofs.ts --epoch 9        # one epoch seal
 node src/verify-proofs.ts --hour 57        # one hour of node rewards
+node src/verify-proofs.ts --payout 19      # one epoch's NVDA payout to holders
+node src/verify-proofs.ts --payout 19 --deep
 ```
 
 It exits with code 1 if any check fails. The same checks run in the browser at https://www.idlex.network/verify.
@@ -204,10 +227,15 @@ node src/net-builder.ts text --prompt "Explain GPUs in one line" --max 128
 node src/net-builder.ts gpus                          # GPUs for rent, with their hourly rate
 node src/net-builder.ts rent --node 0xNODE --hours 2  # book one; your jobs then run on it
 node src/net-builder.ts rental --id r_…               # online time and charge so far
+node src/net-builder.ts extend-rental --id r_… --hours 2  # add hours to a running booking, at its rate
 node src/net-builder.ts end-rental --id r_…           # end a booking early
 ```
 
-A booking holds rate × hours of your credits. You are charged only for the time the GPU was online, and the rest
+With an API key from https://www.idlex.network/build, pass `--api-key idx_…` (or set `IDLEX_API_KEY`) and jobs are
+sent with the key instead of a signature. The rental commands still use the key file.
+
+A booking holds rate × hours of your credits. Extending one holds the extra hours at the booking's own rate, up
+to 24 hours ahead. You are charged only for the time the GPU was online, and the rest
 is released at the next epoch close.
 
 ## Try the whole network on one PC
@@ -277,12 +305,13 @@ the 100 USD minimum.
 | Path | What it is |
 | --- | --- |
 | [src/agent.ts](src/agent.ts) | The node agent: register, idle checks, poll, run, report |
-| [src/ai-runners.ts](src/ai-runners.ts) | Image (Stable Diffusion) and text (llama.cpp) runners |
-| [src/verify.ts](src/verify.ts) | Tolerance checks for image and text outputs |
+| [src/ai-runners.ts](src/ai-runners.ts) | Image (Stable Diffusion), text and embedding (llama.cpp) runners |
+| [src/models.ts](src/models.ts) | Model downloads (`model add`), resumable and SHA-256 checked |
+| [src/verify.ts](src/verify.ts) | Tolerance checks for image, text and embedding outputs |
 | [src/protocol.ts](src/protocol.ts) | Job specs, prices, receipts and request signing |
 | [src/merkle.ts](src/merkle.ts) | Merkle root and proofs over receipts |
-| [src/net-builder.ts](src/net-builder.ts) | Submit image and text jobs, and rent a GPU |
-| [src/verify-proofs.ts](src/verify-proofs.ts) | Recompute epoch seals and hourly rewards, and check them onchain |
+| [src/net-builder.ts](src/net-builder.ts) | Submit image and text jobs, and rent or extend a GPU booking |
+| [src/verify-proofs.ts](src/verify-proofs.ts) | Recompute epoch seals, hourly rewards and NVDA payouts, and check them onchain |
 | [src/proof-math.ts](src/proof-math.ts) | Receipt leaves, Merkle root and reward draws, with only viem |
 | [src/xplat-check.ts](src/xplat-check.ts) | Compares a fixed job's output across machines |
 | [src/scheduler.ts](src/scheduler.ts), [src/ledger.ts](src/ledger.ts) | Local prototype scheduler and simulated ledger |

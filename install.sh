@@ -106,6 +106,18 @@ mkdir -p models
 fetch "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf" models/qwen2.5-3b-instruct-q4_k_m.gguf 626b4a6678b86442240e33df819e00132d3ba7dddfe1cdc4fbb18e0a9615c62d
 # The image model (Stable Diffusion 1.5) downloads into models/hf on the first image job.
 
+step "Embedding model (nomic-embed-text v1.5, 140 MB)"
+fetch "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q8_0.gguf" models/nomic-embed-text-v1.5.Q8_0.gguf 3e24342164b3d94991ba9692fdc0dd08e3fd7362e0aacc396a9a5c54a544c3b7
+
+step "Bigger text model (Qwen2.5-7B Instruct, 4.7 GB)"
+vram=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -n1 | tr -d ' ')
+if [ "${vram:-0}" -ge 10500 ]; then
+  node src/agent.ts model add qwen2.5-7b || echo "  The 7B download stopped. Run it again later (it resumes): node src/agent.ts model add qwen2.5-7b"
+else
+  echo "  Skipped: this GPU has ${vram:-?} MB. Qwen2.5 7B needs about 10.5 GB next to the image model."
+  echo "  On an 8 GB card you can still add it (node src/agent.ts model add qwen2.5-7b) and start with --no-image."
+fi
+
 step "Node key"
 node src/agent.ts init
 

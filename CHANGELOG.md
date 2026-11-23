@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-11-23
+
+### Added
+
+- **Embedding jobs.** Nodes run nomic-embed-text v1.5 (768 dimensions) through llama.cpp. Two results match when
+  every vector pair has a cosine similarity of at least 0.99. The installers fetch the model (140 MB);
+  `--no-embed` leaves it out.
+- **Qwen2.5 7B.** `agent.ts model list` shows the text models on disk and what this GPU can offer, and
+  `agent.ts model add qwen2.5-7b` downloads 7B in two resumable, SHA-256 checked parts (`src/models.ts`). The node
+  offers each text model that fits its VRAM, and says when one needs `--no-image`. The installers fetch 7B on
+  cards with 10.5 GB or more.
+- **NVDA payout checks.** `verify-proofs.ts --payout N` checks one epoch's NVDA payout to holders: the wallets
+  paid, the amounts against the published split, and the team devices against the onchain whitelist and the
+  published multiplier. `--deep` rebuilds every holding from the $IDLEX transfers.
+- **Extend a booking.** `net-builder.ts extend-rental --id r_… --hours N` adds hours to a running booking at its
+  own rate.
+- **Builder API keys.** `net-builder.ts --api-key idx_…` (or `IDLEX_API_KEY`) sends jobs with a key from
+  idlex.network/build instead of a signature.
+
 ## 2026-11-20
 
 ### Added
